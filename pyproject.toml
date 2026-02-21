@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "BoberAutoScanner"
+version = "1.0.0"
+description = "CTF-focused automated recon wrapper for Nmap, NetExec and Web enumeration"
+readme = "README.md"
+requires-python = ">=3.9"
+authors = [
+    { name = "Bobernator" }
+]
+license = { text = "MIT" }
+
+dependencies = []
+
+[project.scripts]
+bober-autoscanner = "bober_autoscanner.cli:main"
