@@ -1002,11 +1002,27 @@ def discover_web_domains(nmap_full_output, target_ip):
                     "schemes": set()
                 }
 
-            # Determine scheme
-            if "ssl" in port_line_lower or "https" in port_line_lower:
+            # Determine scheme more reliably
+
+            scheme = "http"  # default conservative fallback
+
+            # Explicit https indicators in service field
+            if re.search(r"\bhttps\b", port_line_lower):
                 scheme = "https"
-            else:
-                scheme = "http"
+
+            # Common nmap https patterns
+            elif re.search(r"\bssl/http\b", port_line_lower):
+                scheme = "https"
+
+            elif re.search(r"\bssl\b", port_line_lower):
+                scheme = "https"
+
+            # Check full block for TLS certificate evidence
+            elif re.search(r"Subject:\s*commonName=", block):
+                scheme = "https"
+
+            elif re.search(r"SSL certificate", block, re.IGNORECASE):
+                scheme = "https"
 
             web_map[fallback_domain]["ports"].add(port)
             web_map[fallback_domain]["schemes"].add(scheme)
@@ -1254,9 +1270,11 @@ def run_web_crawler(target, target_ip, auto_mode):
     scheme = target["scheme"]
     port = target["port"]
 
+    """
     if not is_valid_domain(host):
         print("\033[1m\033[37m[CRAWLER]\033[0m Skipping: target is not a domain.")
         return
+    """
 
     base_url = f"{scheme}://{host}:{port}"
 
@@ -1571,7 +1589,7 @@ def process_web_targets(validated_targets, wordlist_for_subdomain, target_ip, wo
     # -----------------------------------
     # Hosts update decision for crawler
     # -----------------------------------
-    crawler_hosts_updated = False
+    crawler_hosts_updated = True
 
     domains_for_hosts = extract_domains_from_targets(final_targets)
 
@@ -1587,9 +1605,9 @@ def process_web_targets(validated_targets, wordlist_for_subdomain, target_ip, wo
             auto_mode = auto_mode
         ):
             update_hosts_file(target_ip, domains_for_hosts)
-            crawler_hosts_updated = True
         else:
             print("[*] Hosts update declined. Web crawler will be skipped.")
+            crawler_hosts_updated = False
 
     else:
         print("[*] No valid domains available for hosts update.")
@@ -2065,6 +2083,7 @@ def main():
                 args.wordlist_for_endpoints,
                 auto_mode
             )
+
     except KeyboardInterrupt:
         print("\n\n[!] Global interrupt received.")
         print("[*] All remaining scans cancelled.")

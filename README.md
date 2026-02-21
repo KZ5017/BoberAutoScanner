@@ -248,6 +248,8 @@ You must install the following tools manually:
     
 - `bober-crawler` (custom tool)
     
+- `bober-exec` (custom tool)
+    
 
 ### Optional
 
@@ -405,3 +407,9 @@ It works best when:
 - You treat it as an assistant — not a replacement for analysis.
     
 
+---
+
+# License
+
+MIT License
+Feel free to modify, extend, and redistribute.
