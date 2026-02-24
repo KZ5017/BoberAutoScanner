@@ -126,6 +126,7 @@ def run_nmap_basic(target_ip, ports):
         "--version-all",
         "--scan-delay", "4ms",
         "-vv",
+        "-n",
         "-oN", output_file
     ]
 
@@ -150,6 +151,7 @@ def run_nmap_full(target_ip, ports):
         "-A",
         "--scan-delay", "4ms",
         "-vv",
+        "--dns-servers", target_ip,
         "-oN", output_file
     ]
 
