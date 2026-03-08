@@ -135,8 +135,6 @@ If Windows-related ports are detected (e.g. 389, 445, 3389, 5985, etc.), the too
     
     - SMB
         
-    - RPC
-        
     - LDAP
         
 
@@ -176,9 +174,6 @@ Executed via `nxc smb`, including:
 - Password policy
     
 - Optional extended SMB report (`--create-smb-report`)
-    
-
-Readable shares are automatically dumped using `smbclient`.
 
 ---
 
@@ -234,10 +229,6 @@ You must install the following tools manually:
 ### Windows / AD Enumeration
 
 - `nxc` (NetExec)
-    
-- `rpcclient`
-    
-- `smbclient`
     
 
 ### Web Enumeration
