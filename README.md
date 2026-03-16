@@ -1,3 +1,7 @@
+<p align="center">
+    <img width="765" height="511" alt="BoberAutoScanner" src="https://github.com/user-attachments/assets/d10d8902-0c60-4a44-ac51-ba3592eb33ab" />
+</p>
+
 # BoberAutoScanner
 
 BoberAutoScanner is a Python-based reconnaissance wrapper that orchestrates multiple well-known offensive security tools into a semi-automated workflow.
