@@ -1519,11 +1519,10 @@ def run_endpoint_fuzzing(target, target_ip, wordlist):
 
     else:
 
-        resolve = f"{domain}:{port}:{target_ip}"
-
         ffuf_cmd += [
-            "-u", f"https://{domain}:{port}/FUZZ",
-            "--resolve", resolve,
+            "-u", f"https://{target_ip}:{port}/FUZZ",
+            "-H", f"Host: {domain}",
+            "-sni", domain,
             "-k"
         ]
 
@@ -1765,12 +1764,10 @@ def run_vhost_enum(target, wordlist, target_ip):
 
     else:  # https
 
-        resolve = f"{domain}:{port}:{target_ip}"
-
         ffuf_cmd += [
-            "-u", f"https://{domain}:{port}",
-            "--resolve", resolve,
+            "-u", f"https://{target_ip}:{port}",
             "-H", f"Host: FUZZ.{domain}",
+            "-sni", domain,
             "-k"
         ]
 
