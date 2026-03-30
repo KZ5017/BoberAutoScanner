@@ -830,9 +830,6 @@ def execute_smb_report(target_ip, username, password, dc_host, auth_type):
         auth_type
     )
 
-    if auth_type == "kerberos":
-        base_cmd.append("-k")
-
     with open(output_filename, "w") as report:
 
         for entry in SMB_REPORT_COMMANDS:
