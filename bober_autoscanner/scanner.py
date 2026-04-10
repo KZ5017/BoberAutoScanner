@@ -17,6 +17,7 @@ import string
 import json
 import select
 import time
+import socket
 
 
 # ============================================================
@@ -1570,7 +1571,10 @@ def run_nuclei_scan(target, target_ip):
 # WEB – CRAWLER
 # ============================================================
 
-def run_web_crawler(target, target_ip, auto_mode):
+def run_web_crawler(target, target_ip, auto_mode,
+                    seed_json_file=None,
+                    crawler_active_mode=False,
+                    crawler_check_vulnerabilities=False):
     if not check_tool("bober-crawler"):
         warn_missing_tool("bober-crawler")
         return
@@ -1579,16 +1583,36 @@ def run_web_crawler(target, target_ip, auto_mode):
     port    = target["port"]
     base_url = f"{scheme}://{host}:{port}"
     print(f"\n{white('[CRAWLER]')} Target: {base_url}")
-    if not ask_user("Run web crawler? [y/N]: ", default="yes", auto_mode=auto_mode):
-        print(f"{white('[CRAWLER]')} Skipped.")
-        return
+    print("[*] The crawler will automatically use endpoint fuzzing results as seed input when available.")
     use_proxy = ask_user("Route through Burp proxy (127.0.0.1:8080)? [y/N]: ",
                          default="yes", auto_mode=auto_mode)
-    cmd = ["bober-crawler", "--start-url", f"{base_url}/", "--scope", base_url]
+    cmd = ["bober-crawler", "--start-url", f"{base_url}/", "--scope", base_url,
+           "--debug-level", "1"]
+    if seed_json_file:
+        cmd += ["--seed-json-file", seed_json_file]
+    if crawler_active_mode:
+        cmd.append("--active-mode")
+    if crawler_check_vulnerabilities:
+        cmd.append("--check-vulnerabilities")
     if not use_proxy:
         cmd.append("--no-proxy")
     print(f"{cyan('[CMD]')} {' '.join(cmd)}")
     run_interruptible_command(cmd, "CRAWLER")
+
+
+def can_resolve_host(host):
+    try:
+        addrinfo = socket.getaddrinfo(host, None)
+        resolved_ips = sorted({
+            entry[4][0]
+            for entry in addrinfo
+            if entry and len(entry) > 4 and entry[4]
+        })
+        return True, resolved_ips
+    except socket.gaierror:
+        return False, []
+    except Exception:
+        return False, []
 
 
 # ============================================================
@@ -1713,6 +1737,7 @@ def parse_ffuf_endpoint_results(json_file):
         print(red("[-] Failed to parse ffuf endpoint output."))
         return
     results = data.get("results", [])
+    print(f"{white('[FUZZ]')} Endpoint JSON output saved to {json_file}")
     if not results:
         print(f"{white('[FUZZ]')} No endpoints found.")
         return
@@ -1732,11 +1757,11 @@ def parse_ffuf_endpoint_results(json_file):
 
 def run_endpoint_fuzzing(target, target_ip, wordlist):
     if not wordlist:
-        print(f"{white('[FUZZ]')} No endpoint wordlist. Skipping.")
-        return
+        print(f"{white('[FUZZ]')} No endpoint wordlist provided. Continuing without endpoint fuzzing seed input.")
+        return None
     if not check_tool("ffuf"):
         warn_missing_tool("ffuf")
-        return
+        return None
     scheme = target["scheme"]
     host   = target["host"]
     port   = target["port"]
@@ -1758,6 +1783,7 @@ def run_endpoint_fuzzing(target, target_ip, wordlist):
     print(f"{cyan('[CMD]')} {' '.join(cmd)}")
     run_interruptible_command(cmd, "ENDPOINT FUZZ")
     parse_ffuf_endpoint_results(f"{output_base}.json")
+    return f"{output_base}.json"
 
 
 # ============================================================
@@ -1841,7 +1867,8 @@ def expand_web_targets(validated, wordlist_for_subdomain, target_ip):
 
 
 def scan_web_targets(final_targets, target_ip, crawler_hosts_updated,
-                     wordlist_for_endpoints, auto_mode, run_nuclei, run_cve):
+                     wordlist_for_endpoints, auto_mode, run_nuclei, run_cve,
+                     crawler_active_mode, crawler_check_vulnerabilities):
     for target in final_targets:
         tid = build_target_identifier(target)
         print_sub_section_title(f"Scanning: {tid}", "34")
@@ -1852,7 +1879,7 @@ def scan_web_targets(final_targets, target_ip, crawler_hosts_updated,
         skip_aggressive = False
         if cms_info.get("is_cms"):
             print(f"{yellow('[!]')} CMS: {cms_info['cms_type']} ({cms_info['confidence']})")
-            if not ask_user("Run crawling/fuzzing anyway? [y/N]: ",
+            if not ask_user("Run endpoint fuzzing and web crawling anyway? [y/N]: ",
                             default="yes", auto_mode=auto_mode):
                 skip_aggressive = True
 
@@ -1867,12 +1894,43 @@ def scan_web_targets(final_targets, target_ip, crawler_hosts_updated,
             print("[*] Skipping aggressive modules for this target.")
             continue
 
-        if crawler_hosts_updated:
-            run_web_crawler(target, target_ip, auto_mode)
-        else:
-            print("[*] Web crawler skipped (hosts not updated).")
+        seed_json_file = run_endpoint_fuzzing(target, target_ip, wordlist_for_endpoints)
 
-        run_endpoint_fuzzing(target, target_ip, wordlist_for_endpoints)
+        crawler_allowed = True
+
+        if target["is_domain"] and not crawler_hosts_updated:
+            print("[*] Hosts file was not updated for domain-based crawling. Testing DNS resolution...")
+            dns_ok, resolved_ips = can_resolve_host(target["host"])
+            if dns_ok:
+                resolved_ip_text = ", ".join(resolved_ips) if resolved_ips else "unknown addresses"
+                print(f"[+] Domain resolves successfully to: {resolved_ip_text}")
+                if target_ip in resolved_ips:
+                    print("[+] Resolved IP list includes the target IP. Web crawler can still run.")
+                else:
+                    print(f"{yellow('[!]')} Resolved IP list does not include the target IP.")
+                    print(f"{yellow('[!]')} The crawler may reach a different host than the intended target.")
+                    if not ask_user(
+                        "This domain does not resolve to the original target IP, so the crawler may reach a different host. Run web crawler anyway? [y/N]: ",
+                        default="no",
+                        auto_mode=auto_mode
+                    ):
+                        print("[*] Web crawler skipped for this domain target (resolved IPs do not include the target IP).")
+                        crawler_allowed = False
+            else:
+                print("[*] Web crawler skipped for this domain target (no hosts update and DNS resolution failed).")
+                crawler_allowed = False
+
+        if not crawler_allowed:
+            continue
+
+        run_web_crawler(
+            target,
+            target_ip,
+            auto_mode,
+            seed_json_file=seed_json_file,
+            crawler_active_mode=crawler_active_mode,
+            crawler_check_vulnerabilities=crawler_check_vulnerabilities
+        )
 
 
 def extract_domains_from_targets(final_targets):
@@ -1880,7 +1938,8 @@ def extract_domains_from_targets(final_targets):
 
 
 def process_web_targets(validated, wordlist_for_subdomain, target_ip,
-                        wordlist_for_endpoints, auto_mode, run_nuclei=False, run_cve=False):
+                        wordlist_for_endpoints, auto_mode, run_nuclei=False, run_cve=False,
+                        crawler_active_mode=False, crawler_check_vulnerabilities=False):
     print_sub_section_title("Expanding Web Targets (VHOST ENUM)", "34")
     final = expand_web_targets(validated, wordlist_for_subdomain, target_ip)
     print("\n[+] Final web target list:")
@@ -1890,18 +1949,21 @@ def process_web_targets(validated, wordlist_for_subdomain, target_ip,
     crawler_ok = True
     domains    = extract_domains_from_targets(final)
     if domains:
-        print("\n[!] Crawler needs proper DNS resolution.")
+        print("\n[!] The bober-crawler tool needs domain-based targets to resolve correctly.")
+        print("    Updating /etc/hosts is the most reliable option for domain-based targets.")
+        print("    If you skip it, the tool will still try normal DNS resolution per target before skipping the crawler.\n")
         if ask_user("Update /etc/hosts with web target domains? [y/N]: ",
                     default="yes", auto_mode=auto_mode):
             update_hosts_file(target_ip, domains)
         else:
-            print("[*] Hosts update declined. Crawler will be skipped.")
+            print("[*] Hosts update declined. Domain targets will use a DNS resolution fallback before the crawler is skipped.")
             crawler_ok = False
     else:
         print("[*] No valid domains for hosts update.")
 
     scan_web_targets(final, target_ip, crawler_ok,
-                     wordlist_for_endpoints, auto_mode, run_nuclei, run_cve)
+                     wordlist_for_endpoints, auto_mode, run_nuclei, run_cve,
+                     crawler_active_mode, crawler_check_vulnerabilities)
 
 
 # ============================================================
@@ -2243,6 +2305,14 @@ def main():
             action="store_true",
             help="Disable auto-timeout answers (fully interactive)")
 
+        parser.add_argument("--crawler-active-mode",
+            action="store_true",
+            help="Enable bober-crawler active mode")
+
+        parser.add_argument("--crawler-check-vulnerabilities",
+            action="store_true",
+            help="Enable bober-crawler vulnerability checks")
+
         parser.add_argument("--snmp",
             action="store_true",
             help="Force SNMP enumeration even if UDP 161 not in TCP scan results")
@@ -2431,6 +2501,8 @@ def main():
                 auto_mode,
                 run_nuclei=args.nuclei,
                 run_cve=args.cve,
+                crawler_active_mode=args.crawler_active_mode,
+                crawler_check_vulnerabilities=args.crawler_check_vulnerabilities,
             )
 
         # ────────────────────────────────────────────────────

@@ -45,6 +45,18 @@ bober-autoscanner 10.10.11.1 --skip-nmap
 # Full combo: nuclei + CVE + fuzzing
 bober-autoscanner 10.10.11.1 --nuclei --cve -wfe /usr/share/seclists/Discovery/Web-Content/common.txt
 
+# Web-heavy target: vHost fuzzing + endpoint fuzzing + Nuclei + CVE
+bober-autoscanner 10.10.11.1 --skip-nmap --nuclei --cve -wfs /usr/share/seclists/Discovery/DNS/subdomains-top1million-5000.txt -wfe /usr/share/seclists/Discovery/Web-Content/raft-medium-directories.txt
+
+# Burp-friendly interactive web run
+bober-autoscanner 10.10.11.1 --skip-nmap --no-auto -wfs /usr/share/seclists/Discovery/DNS/subdomains-top1million-5000.txt -wfe /usr/share/seclists/Discovery/Web-Content/common.txt
+
+# Crawler active mode
+bober-autoscanner 10.10.11.1 --skip-nmap -wfe /usr/share/seclists/Discovery/Web-Content/common.txt --crawler-active-mode
+
+# Crawler vulnerability checks
+bober-autoscanner 10.10.11.1 --skip-nmap -wfe /usr/share/seclists/Discovery/Web-Content/common.txt --crawler-check-vulnerabilities
+
 # SNMP with known community string
 bober-autoscanner 10.10.11.1 --snmp-community public
 ```
@@ -92,6 +104,9 @@ TARGET IP
 │                 │  │  vHost fuzzing                   │
 │                 │  │  Endpoint fuzzing                │
 │                 │  │  Web crawler (Burp proxy opt.)   │
+│                 │  │  → seed JSON from ffuf           │
+│                 │  │  → active mode / vuln checks     │
+│                 │  │  Baseline-aware web workflow     │
 └─────────────────┘  └──────────────────────────────────┘
        │
        ▼
@@ -172,6 +187,10 @@ TARGET IP
 | **vHost fuzzing**        | `ffuf` with smart baseline — redirect codes never filtered               |
 | **Endpoint fuzzing**     | `ffuf` with word-count baseline filtering                                |
 | **Web crawler**          | `bober-crawler` with optional Burp Suite proxy integration               |
+| **Seeded crawling**      | Endpoint `ffuf` JSON output is passed into the crawler as seed input     |
+| **Crawler active mode**  | `--crawler-active-mode` enables more aggressive interactive crawling     |
+| **Crawler vuln checks**  | `--crawler-check-vulnerabilities` enables crawler-driven vulnerability checks |
+| **Crawler safeguards**   | Falls back to DNS checks when hosts entries are skipped for domain targets |
 
 ---
 
@@ -200,32 +219,45 @@ All files are written to `<target_ip>_scan/` (or custom `-o` path).
 ## 🚩 Flags
 
 ```
-bober-autoscanner <target_ip> [options]
+usage: BoberAutoScanner.py [-h] [-u USERNAME] [-p PASSWORD] [-H HASH] [-sn] [-spu] [-csr]
+                           [-wfs WORDLIST_FOR_SUBDOMAIN] [-wfe WORDLIST_FOR_ENDPOINTS] [--nuclei] [--cve]
+                           [--no-auto] [--crawler-active-mode] [--crawler-check-vulnerabilities] [--snmp]
+                           [--snmp-community SNMP_COMMUNITY] [-o OUTPUT_DIR]
+                           target
 
-Authentication:
-  -u, --username              Username
-  -p, --password              Password
-  -H, --hash                  NTLM hash (:NT or LM:NT)
+BoberAutoScanner – Turbocharged Edition
 
-Scan control:
-  -sn, --skip-nmap            Skip RustScan/Nmap, use existing scan files
+positional arguments:
+  target                Target IP address
+
+options:
+  -h, --help            show this help message and exit
+  -u, --username USERNAME
+                        Username
+  -p, --password PASSWORD
+                        Password
+  -H, --hash HASH       NTLM hash  (:NT  or  LM:NT)
+  -sn, --skip-nmap      Skip RustScan/Nmap (use existing scan files)
   -spu, --skip-passwordless-users
-                              Skip anonymous and guest auth rounds
-
-Modules:
-  --nuclei                    Run Nuclei against web targets
-  --cve                       CVE lookup via searchsploit + NVD API
-  --snmp                      Force SNMP enumeration (no UDP scan needed)
-  --snmp-community <string>   Use specific community string (skips brute)
-  -wfs, --wordlist-for-subdomain
-                              Wordlist for vHost fuzzing
-  -wfe, --wordlist-for-endpoints
-                              Wordlist for endpoint fuzzing
-  -csr, --create-smb-report   Extended SMB report (needs high privileges)
-
-Output:
-  -o, --output-dir            Custom output directory (default: <ip>_scan/)
-  --no-auto                   Fully interactive (disable auto-timeouts)
+                        Skip anonymous and guest auth rounds
+  -csr, --create-smb-report
+                        Create extended SMB report (needs high privileges)
+  -wfs, --wordlist-for-subdomain WORDLIST_FOR_SUBDOMAIN
+                        Wordlist for virtual host fuzzing
+  -wfe, --wordlist-for-endpoints WORDLIST_FOR_ENDPOINTS
+                        Wordlist for endpoint fuzzing
+  --nuclei              Run nuclei against discovered web targets
+  --cve                 CVE lookup for detected software versions (searchsploit + NVD API)
+  --no-auto             Disable auto-timeout answers (fully interactive)
+  --crawler-active-mode
+                        Enable bober-crawler active mode
+  --crawler-check-vulnerabilities
+                        Enable bober-crawler vulnerability checks
+  --snmp                Force SNMP enumeration even if UDP 161 not in TCP scan results
+  --snmp-community SNMP_COMMUNITY
+                        Use specific SNMP community string (skips bruteforce)
+  -o, --output-dir OUTPUT_DIR
+                        Output directory (default: <target_ip>_scan/)
 ```
 
 ---
@@ -251,32 +283,6 @@ apt install seclists
 # Custom (Bober ecosystem)
 bober-crawler    # separate repo
 bober-exec       # separate repo
-```
-
----
-
-## 💡 Usage Examples
-
-```bash
-# First scan — auto-updates /etc/hosts
-bober-autoscanner 10.10.11.1
-
-# Subsequent runs — skip nmap, reuse files
-bober-autoscanner 10.10.11.1 --skip-nmap --nuclei --cve
-
-# AD box with hash
-bober-autoscanner 10.10.11.1 -u administrator -H :ntlmhash -csr
-
-# SNMP box
-bober-autoscanner 10.10.11.1 --snmp-community public
-
-# Full web box
-bober-autoscanner 10.10.11.1 --skip-nmap --nuclei --cve \
-  -wfs /usr/share/seclists/Discovery/DNS/subdomains-top1million-5000.txt \
-  -wfe /usr/share/seclists/Discovery/Web-Content/raft-medium-directories.txt
-
-# Update nuclei templates before first --nuclei run
-nuclei -update-templates
 ```
 
 ---
