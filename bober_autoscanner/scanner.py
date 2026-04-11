@@ -1190,6 +1190,24 @@ def fetch_url(target, target_ip, path="/", head=False):
     return result.stdout
 
 
+def fetch_status_code(target, target_ip, path="/"):
+    scheme = target["scheme"]
+    host   = target["host"]
+    port   = target["port"]
+    if scheme == "http":
+        cmd = ["curl", "-s", "-k", "-o", "/dev/null",
+               "-w", "%{http_code}",
+               "-H", f"Host: {host}",
+               f"http://{target_ip}:{port}{path}"]
+    else:
+        cmd = ["curl", "-s", "-k", "-o", "/dev/null",
+               "-w", "%{http_code}",
+               "--resolve", f"{host}:{port}:{target_ip}",
+               f"https://{host}:{port}{path}"]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    return result.stdout.strip()
+
+
 # ============================================================
 # WEB – EXTENDED FINGERPRINTING (NEW)
 # ============================================================
@@ -1275,6 +1293,10 @@ def fingerprint_web_target(target, target_ip):
         print(f"    X-Powered-By : {fp['x_powered_by']}")
     if fp["cms"].get("is_cms"):
         print(f"    CMS          : {fp['cms']['cms_type']} ({fp['cms']['confidence']})")
+    elif fp["cms"].get("confidence") == "low":
+        print(f"    CMS?         : {fp['cms']['cms_type']} ({fp['cms']['confidence']})")
+    for item in fp["cms"].get("evidence", []):
+        print(f"      evidence   : {item}")
     if fp["tech_hints"]:
         print(f"    Tech         : {', '.join(set(fp['tech_hints']))}")
     if fp["jwt_found"]:
@@ -1286,43 +1308,94 @@ def fingerprint_web_target(target, target_ip):
 
 
 def _detect_cms(headers, body, target, target_ip):
-    ev = {"wordpress": 0, "drupal": 0, "joomla": 0}
-    if "X-Pingback" in headers:
-        ev["wordpress"] += 1
-    if "X-Generator: Drupal" in headers:
-        ev["drupal"] += 2
-    if "Joomla" in headers:
-        ev["joomla"] += 1
-    if 'content="WordPress' in body:
-        return {"is_cms": True, "cms_type": "wordpress", "confidence": "high"}
-    if 'content="Drupal' in body:
-        return {"is_cms": True, "cms_type": "drupal",    "confidence": "high"}
-    if 'content="Joomla' in body:
-        return {"is_cms": True, "cms_type": "joomla",    "confidence": "high"}
-    for path, status_ok, key in [
-        ("/wp-login.php",     ("200", "302"), "wordpress"),
-        ("/wp-content/",      ("200", "403"), "wordpress"),
-        ("/core/",            ("200",),       "drupal"),
-        ("/sites/default/",   ("200", "403"), "drupal"),
-        ("/administrator/",   ("200", "302"), "joomla"),
+    scores = {"wordpress": 0, "drupal": 0, "joomla": 0}
+    evidence = {"wordpress": [], "drupal": [], "joomla": []}
+    headers_lower = headers.lower()
+    body_lower = body.lower()
+
+    def add(cms, points, reason):
+        scores[cms] += points
+        evidence[cms].append(reason)
+
+    # Header and generator signals.
+    if "x-pingback" in headers_lower:
+        add("wordpress", 2, "X-Pingback header")
+    if re.search(r'<meta[^>]+name=["\']generator["\'][^>]+content=["\'][^"\']*wordpress', body, re.I):
+        add("wordpress", 4, "WordPress generator meta tag")
+    if re.search(r'<meta[^>]+name=["\']generator["\'][^>]+content=["\'][^"\']*drupal', body, re.I):
+        add("drupal", 4, "Drupal generator meta tag")
+    if re.search(r'<meta[^>]+name=["\']generator["\'][^>]+content=["\'][^"\']*joomla', body, re.I):
+        add("joomla", 4, "Joomla generator meta tag")
+    if "x-generator: drupal" in headers_lower:
+        add("drupal", 4, "X-Generator: Drupal header")
+    if "joomla" in headers_lower:
+        add("joomla", 2, "Joomla string in response headers")
+
+    # Body asset and framework-specific markers.
+    for marker, reason in [
+        ("wp-content", "wp-content asset path"),
+        ("wp-includes", "wp-includes asset path"),
+        ("wp-json", "wp-json reference"),
+        ("wp-emoji-release", "WordPress emoji asset"),
+        ("wp-block-library", "WordPress block library asset"),
     ]:
-        resp = fetch_url(target, target_ip, path, head=True)
-        if any(s in resp for s in status_ok):
-            ev[key] += 1
-    best = max(ev, key=ev.get)
-    if ev[best] >= 2:
-        return {"is_cms": True, "cms_type": best, "confidence": "medium"}
-    return {"is_cms": False}
+        if marker in body_lower:
+            add("wordpress", 2, reason)
 
+    for marker, reason in [
+        ("drupalsettings", "drupalSettings JavaScript object"),
+        ("/core/misc/drupal", "Drupal core JavaScript asset"),
+        ("/sites/default/files", "Drupal public files path"),
+    ]:
+        if marker in body_lower:
+            add("drupal", 2, reason)
 
-# Legacy shim (used by scan_web_targets when nuclei is off)
-def detect_cms(target, target_ip):
-    print(f"[*] CMS detection: {target['host']}")
-    h = fetch_url(target, target_ip, path="/", head=True)
-    b = fetch_url(target, target_ip)
-    return _detect_cms(h, b, target, target_ip)
+    for marker, reason in [
+        ("/media/system/js/", "Joomla system JavaScript asset"),
+        ("/media/com_", "Joomla component media path"),
+        ("option=com_", "Joomla component URL pattern"),
+        ("com_content", "Joomla com_content marker"),
+        ("com_users", "Joomla com_users marker"),
+    ]:
+        if marker in body_lower:
+            add("joomla", 2, reason)
+    if re.search(r"/templates/[^/]+/", body_lower):
+        add("joomla", 1, "Joomla-style template asset path")
 
+    # Passive path checks. Status codes are read explicitly via curl -w to avoid
+    # matching arbitrary "200"/"302" strings in headers or bodies.
+    for path, status_ok, cms, reason, points in [
+        ("/wp-login.php",   {"200", "302"},        "wordpress", "wp-login.php status", 2),
+        ("/wp-admin/",      {"301", "302", "403"}, "wordpress", "wp-admin status", 1),
+        ("/wp-json/",       {"200"},               "wordpress", "wp-json endpoint status", 2),
+        ("/xmlrpc.php",     {"200", "405"},        "wordpress", "xmlrpc.php status", 1),
+        ("/core/",          {"200", "403"},        "drupal",    "Drupal /core/ status", 2),
+        ("/sites/default/", {"200", "403"},        "drupal",    "Drupal /sites/default/ status", 2),
+        ("/user/login",     {"200", "302"},        "drupal",    "Drupal /user/login status", 1),
+        ("/administrator/", {"200", "302"},        "joomla",    "Joomla /administrator/ status", 1),
+    ]:
+        status = fetch_status_code(target, target_ip, path)
+        if status in status_ok:
+            add(cms, points, f"{reason}: {path} returned {status}")
 
+    best = max(scores, key=scores.get)
+    best_score = scores[best]
+    if best_score >= 4:
+        confidence = "high"
+    elif best_score >= 2:
+        confidence = "medium"
+    elif best_score > 0:
+        confidence = "low"
+    else:
+        return {"is_cms": False, "evidence": {}}
+
+    return {
+        "is_cms": confidence in ("medium", "high"),
+        "cms_type": best,
+        "confidence": confidence,
+        "score": best_score,
+        "evidence": evidence[best],
+    }
 
 # ============================================================
 # CVE LOOKUP – searchsploit + NVD API
@@ -1508,7 +1581,58 @@ def _find_nuclei_templates_dir():
     return None
 
 
-def run_nuclei_scan(target, target_ip):
+def build_nuclei_tags_from_fingerprint(fingerprint):
+    tags = set()
+
+    def add_tag(value):
+        if value:
+            tags.add(value)
+
+    cms = fingerprint.get("cms") or {}
+    if cms.get("cms_type") in {"wordpress", "drupal", "joomla"}:
+        add_tag(cms["cms_type"])
+
+    header_text = " ".join([
+        fingerprint.get("server") or "",
+        fingerprint.get("x_powered_by") or "",
+    ]).lower()
+
+    header_tag_map = {
+        "nginx": "nginx",
+        "apache": "apache",
+        "iis": "iis",
+        "microsoft-iis": "iis",
+        "tomcat": "tomcat",
+        "php": "php",
+        "express": "express",
+        "asp.net": "aspnet",
+        "aspnet": "aspnet",
+    }
+    for marker, tag in header_tag_map.items():
+        if marker in header_text:
+            add_tag(tag)
+
+    tech_tag_map = {
+        "WordPress assets": "wordpress",
+        "Drupal": "drupal",
+        "Joomla": "joomla",
+        "Laravel": "laravel",
+        "Django": "django",
+        "Flask": "flask",
+        "PHP": "php",
+        "React": "react",
+        "Angular": "angular",
+        "Vue.js": "vue",
+        "ASP.NET": "aspnet",
+        "Express.js": "express",
+    }
+    for hint in fingerprint.get("tech_hints") or []:
+        add_tag(tech_tag_map.get(hint))
+
+    return sorted(tags)
+
+
+def run_nuclei_scan(target, target_ip, fingerprint=None):
     if not check_tool("nuclei"):
         warn_missing_tool("nuclei")
         return
@@ -1526,12 +1650,13 @@ def run_nuclei_scan(target, target_ip):
         print(f"{yellow('[NUCLEI]')} Templates not found. Run: nuclei -update-templates")
         return
 
-    # nuclei v3 moved templates under http/ subdirectory
-    # Try both v2 (cves/) and v3 (http/cves/) paths
+    # Prefer nuclei v3 HTTP template categories, but keep v2 fallbacks.
     CATEGORIES = [
-        "cves", "misconfiguration", "exposures", "default-logins",           # v2
-        "http/cves", "http/misconfiguration", "http/exposures",               # v3
-        "http/default-logins", "http/technologies",                           # v3
+        "http/cves", "http/exposures", "http/vulnerabilities",
+        "http/default-logins", "http/misconfiguration",
+        "http/technologies", "http/exposed-panels",
+        "http/miscellaneous",
+        "cves", "misconfiguration", "exposures", "default-logins",
     ]
     tmpl_args = []
     seen = set()
@@ -1548,13 +1673,25 @@ def run_nuclei_scan(target, target_ip):
 
     print(f"\n{yellow('[NUCLEI]')} Scanning {url}  ({host})")
     print(f"  Templates: {tmpl_dir}")
+    tags = build_nuclei_tags_from_fingerprint(fingerprint or {})
+    if tags:
+        print(f"  Tags     : {', '.join(tags)}")
+    else:
+        print("  Tags     : none detected – using severity filter")
+
     cmd = [
         "nuclei", "-u", url,
     ] + tmpl_args + [
-        "-severity", "critical,high,medium",
         "-silent", "-o", out,
-        "-timeout", "5", "-retries", "1",
-    ] + extra
+        "-rl", "8", "-c", "8",
+        "-headless", "-headc", "1", "-hbs", "1",
+        "-timeout", "8", "-retries", "2", "-mhe", "16",
+    ]
+    if tags:
+        cmd += ["-tags", ",".join(tags)]
+    else:
+        cmd += ["-severity", "critical,high,medium"]
+    cmd += extra
 
     print(f"{cyan('[CMD]')} {' '.join(cmd)}")
     run_interruptible_command(cmd, "NUCLEI")
@@ -1585,7 +1722,7 @@ def run_web_crawler(target, target_ip, auto_mode,
     print(f"\n{white('[CRAWLER]')} Target: {base_url}")
     print("[*] The crawler will automatically use endpoint fuzzing results as seed input when available.")
     use_proxy = ask_user("Route through Burp proxy (127.0.0.1:8080)? [y/N]: ",
-                         default="yes", auto_mode=auto_mode)
+                         default="yes", timeout=24, auto_mode=auto_mode)
     cmd = ["bober-crawler", "--start-url", f"{base_url}/", "--scope", base_url,
            "--debug-level", "1"]
     if seed_json_file:
@@ -1877,10 +2014,27 @@ def scan_web_targets(final_targets, target_ip, crawler_hosts_updated,
         cms_info = fp.get("cms", {})
 
         skip_aggressive = False
-        if cms_info.get("is_cms"):
-            print(f"{yellow('[!]')} CMS: {cms_info['cms_type']} ({cms_info['confidence']})")
-            if not ask_user("Run endpoint fuzzing and web crawling anyway? [y/N]: ",
-                            default="yes", auto_mode=auto_mode):
+        cms_confidence = cms_info.get("confidence")
+        if cms_confidence in ("low", "medium", "high"):
+            cms_type = cms_info.get("cms_type", "unknown")
+            print(f"{yellow('[!]')} CMS signal: {cms_type} ({cms_confidence})")
+
+            if cms_confidence == "low":
+                default = "yes"
+                timeout = 8
+            elif cms_confidence == "medium":
+                default = "no"
+                timeout = 24
+            else:
+                default = "no"
+                timeout = 8
+
+            if not ask_user(
+                f"Run endpoint fuzzing and web crawling anyway for this {cms_confidence} confidence CMS signal? [y/N]: ",
+                default=default,
+                timeout=timeout,
+                auto_mode=auto_mode
+            ):
                 skip_aggressive = True
 
         # CVE lookup always runs after fingerprint (needs version info)
@@ -1888,7 +2042,7 @@ def scan_web_targets(final_targets, target_ip, crawler_hosts_updated,
             run_cve_lookup(fp)
 
         if run_nuclei:
-            run_nuclei_scan(target, target_ip)
+            run_nuclei_scan(target, target_ip, fp)
 
         if skip_aggressive:
             print("[*] Skipping aggressive modules for this target.")
