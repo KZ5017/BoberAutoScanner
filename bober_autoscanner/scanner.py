@@ -119,9 +119,9 @@ def warn_missing_tool(name):
 
 def ask_user(question, default="yes", timeout=8, auto_mode=True):
     if not auto_mode:
-        answer = input(question).strip().lower()
+        answer = input(white(question)).strip().lower()
         return answer == "y"
-    print(f"{question} (default: {default.upper()} in {timeout}s)")
+    print(white(f"{question} (default: {default.upper()} in {timeout}s)"))
     print("> ", end="", flush=True)
     start = time.time()
     while True:
@@ -1270,6 +1270,8 @@ def fingerprint_web_target(target, target_ip):
         ("ruby on rails", "Ruby on Rails"),
         ("django", "Django"),
         ("flask", "Flask"),
+        ("spring boot", "Spring Boot"),
+        ("whitelabel error page", "Spring Boot"),
         ("powered by php", "PHP"),
         ("jquery", "jQuery"),
         ("react", "React"),
@@ -1277,6 +1279,21 @@ def fingerprint_web_target(target, target_ip):
         ("vue", "Vue.js"),
         ("asp.net", "ASP.NET"),
         ("express", "Express.js"),
+        ("__next", "Next.js"),
+        ("next.js", "Next.js"),
+        ("nuxt", "Nuxt.js"),
+        ("x-jenkins", "Jenkins"),
+        ("jenkins", "Jenkins"),
+        ("grafana", "Grafana"),
+        ("gitlab", "GitLab"),
+        ("sonarqube", "SonarQube"),
+        ("kibana", "Kibana"),
+        ("elasticsearch", "Elasticsearch"),
+        ("prometheus", "Prometheus"),
+        ("pterodactyl", "Pterodactyl"),
+        ("keycloak", "Keycloak"),
+        ("swagger-ui", "Swagger UI"),
+        ("openapi", "OpenAPI"),
     ]
     body_lower = body.lower()
     for keyword, label in TECH_PATTERNS:
@@ -1561,6 +1578,9 @@ def run_cve_lookup(fingerprint):
 # WEB – NUCLEI (NEW)
 # ============================================================
 
+NUCLEI_AVAILABLE_TAGS_CACHE = {}
+
+
 def _find_nuclei_templates_dir():
     """
     Resolve the nuclei templates directory.
@@ -1581,7 +1601,68 @@ def _find_nuclei_templates_dir():
     return None
 
 
-def build_nuclei_tags_from_fingerprint(fingerprint):
+def _load_available_nuclei_tags(template_paths):
+    cache_key = tuple(sorted(template_paths))
+    if cache_key in NUCLEI_AVAILABLE_TAGS_CACHE:
+        return NUCLEI_AVAILABLE_TAGS_CACHE[cache_key]
+
+    available_tags = set()
+    for template_path in template_paths:
+        base = Path(template_path)
+        if not base.is_dir():
+            continue
+        for yaml_file in list(base.rglob("*.yaml")) + list(base.rglob("*.yml")):
+            try:
+                content = yaml_file.read_text(encoding="utf-8", errors="ignore")
+            except Exception:
+                continue
+            for match in re.findall(r"(?im)^\s*tags:\s*(.+?)\s*$", content):
+                raw_tags = match.strip().strip("\"'")
+                available_tags.update(
+                    tag.strip().lower()
+                    for tag in raw_tags.split(",")
+                    if tag.strip()
+                )
+
+    NUCLEI_AVAILABLE_TAGS_CACHE[cache_key] = available_tags
+    return available_tags
+
+
+def _build_nuclei_template_args(tmpl_dir, categories):
+    tmpl_args = []
+    template_paths = []
+    seen = set()
+    for cat in categories:
+        cat_path = os.path.join(tmpl_dir, cat)
+        if os.path.isdir(cat_path) and cat_path not in seen:
+            tmpl_args += ["-t", cat_path]
+            template_paths.append(cat_path)
+            seen.add(cat_path)
+    return tmpl_args, template_paths
+
+
+def _count_nuclei_templates(template_paths, severities=None):
+    count = 0
+    severity_filter = {s.lower() for s in severities} if severities else None
+    for template_path in template_paths:
+        base = Path(template_path)
+        if not base.is_dir():
+            continue
+        for yaml_file in list(base.rglob("*.yaml")) + list(base.rglob("*.yml")):
+            if severity_filter is None:
+                count += 1
+                continue
+            try:
+                content = yaml_file.read_text(encoding="utf-8", errors="ignore")
+            except Exception:
+                continue
+            severity_match = re.search(r"(?im)^\s*severity:\s*['\"]?([a-z]+)", content)
+            if severity_match and severity_match.group(1).lower() in severity_filter:
+                count += 1
+    return count
+
+
+def build_nuclei_tags_from_fingerprint(fingerprint, available_tags=None):
     tags = set()
 
     def add_tag(value):
@@ -1602,7 +1683,22 @@ def build_nuclei_tags_from_fingerprint(fingerprint):
         "apache": "apache",
         "iis": "iis",
         "microsoft-iis": "iis",
+        "jetty": "jetty",
         "tomcat": "tomcat",
+        "openresty": "openresty",
+        "gunicorn": "gunicorn",
+        "uvicorn": "uvicorn",
+        "werkzeug": "werkzeug",
+        "jboss": "jboss",
+        "wildfly": "wildfly",
+        "weblogic": "weblogic",
+        "glassfish": "glassfish",
+        "kestrel": "aspnet",
+        "spring": "spring",
+        "node.js": "nodejs",
+        "nodejs": "nodejs",
+        "next.js": "nextjs",
+        "nextjs": "nextjs",
         "php": "php",
         "express": "express",
         "asp.net": "aspnet",
@@ -1617,22 +1713,39 @@ def build_nuclei_tags_from_fingerprint(fingerprint):
         "Drupal": "drupal",
         "Joomla": "joomla",
         "Laravel": "laravel",
+        "Ruby on Rails": "rails",
         "Django": "django",
         "Flask": "flask",
+        "Spring Boot": "spring",
         "PHP": "php",
         "React": "react",
         "Angular": "angular",
         "Vue.js": "vue",
         "ASP.NET": "aspnet",
         "Express.js": "express",
+        "Next.js": "nextjs",
+        "Nuxt.js": "nuxtjs",
+        "Jenkins": "jenkins",
+        "Grafana": "grafana",
+        "GitLab": "gitlab",
+        "SonarQube": "sonarqube",
+        "Kibana": "kibana",
+        "Elasticsearch": "elasticsearch",
+        "Prometheus": "prometheus",
+        "Pterodactyl": "pterodactyl",
+        "Keycloak": "keycloak",
+        "Swagger UI": "swagger",
+        "OpenAPI": "openapi",
     }
     for hint in fingerprint.get("tech_hints") or []:
         add_tag(tech_tag_map.get(hint))
 
+    if available_tags is not None:
+        return sorted(tags & available_tags)
     return sorted(tags)
 
 
-def run_nuclei_scan(target, target_ip, fingerprint=None):
+def run_nuclei_scan(target, target_ip, fingerprint=None, auto_mode=True):
     if not check_tool("nuclei"):
         warn_missing_tool("nuclei")
         return
@@ -1650,21 +1763,21 @@ def run_nuclei_scan(target, target_ip, fingerprint=None):
         print(f"{yellow('[NUCLEI]')} Templates not found. Run: nuclei -update-templates")
         return
 
-    # Prefer nuclei v3 HTTP template categories, but keep v2 fallbacks.
-    CATEGORIES = [
+    tagged_categories = [
         "http/cves", "http/exposures", "http/vulnerabilities",
         "http/default-logins", "http/misconfiguration",
         "http/technologies", "http/exposed-panels",
         "http/miscellaneous",
         "cves", "misconfiguration", "exposures", "default-logins",
     ]
-    tmpl_args = []
-    seen = set()
-    for cat in CATEGORIES:
-        cat_path = os.path.join(tmpl_dir, cat)
-        if os.path.isdir(cat_path) and cat_path not in seen:
-            tmpl_args += ["-t", cat_path]
-            seen.add(cat_path)
+    fallback_categories = [
+        "http/cves", "http/vulnerabilities", "http/exposures",
+    ]
+    fallback_legacy_categories = [
+        "cves", "exposures",
+    ]
+
+    tmpl_args, template_paths = _build_nuclei_template_args(tmpl_dir, tagged_categories)
 
     if not tmpl_args:
         print(f"{yellow('[NUCLEI]')} No template categories found in {tmpl_dir}")
@@ -1673,16 +1786,35 @@ def run_nuclei_scan(target, target_ip, fingerprint=None):
 
     print(f"\n{yellow('[NUCLEI]')} Scanning {url}  ({host})")
     print(f"  Templates: {tmpl_dir}")
-    tags = build_nuclei_tags_from_fingerprint(fingerprint or {})
+    available_tags = _load_available_nuclei_tags(template_paths)
+    tags = build_nuclei_tags_from_fingerprint(fingerprint or {}, available_tags)
     if tags:
         print(f"  Tags     : {', '.join(tags)}")
     else:
+        tmpl_args, template_paths = _build_nuclei_template_args(tmpl_dir, fallback_categories)
+        if not tmpl_args:
+            tmpl_args, template_paths = _build_nuclei_template_args(tmpl_dir, fallback_legacy_categories)
+        if not tmpl_args:
+            print(f"{yellow('[NUCLEI]')} No fallback template categories found in {tmpl_dir}")
+            print(f"  {yellow('[HINT]')} Run: nuclei -update-templates")
+            return
         print("  Tags     : none detected – using severity filter")
+        print("  Mode     : fallback template set")
+        fallback_template_count = _count_nuclei_templates(template_paths, {"critical", "high"})
+        estimated_minutes = max(1, round(fallback_template_count / 300)) if fallback_template_count else "several"
+        if not ask_user(
+            f"No useful nuclei tags detected. Fallback may load about {fallback_template_count or 'unknown'} templates and take roughly {estimated_minutes} minute(s). Run high/critical nuclei fallback scan anyway? [y/N]: ",
+            default="no",
+            timeout=24,
+            auto_mode=auto_mode
+        ):
+            print("[*] Nuclei fallback scan skipped.")
+            return
 
     cmd = [
         "nuclei", "-u", url,
     ] + tmpl_args + [
-        "-silent", "-o", out,
+        "-o", out,
         "-rl", "8", "-c", "8",
         "-headless", "-headc", "1", "-hbs", "1",
         "-timeout", "8", "-retries", "2", "-mhe", "16",
@@ -1690,7 +1822,7 @@ def run_nuclei_scan(target, target_ip, fingerprint=None):
     if tags:
         cmd += ["-tags", ",".join(tags)]
     else:
-        cmd += ["-severity", "critical,high,medium"]
+        cmd += ["-severity", "critical,high"]
     cmd += extra
 
     print(f"{cyan('[CMD]')} {' '.join(cmd)}")
@@ -2042,7 +2174,7 @@ def scan_web_targets(final_targets, target_ip, crawler_hosts_updated,
             run_cve_lookup(fp)
 
         if run_nuclei:
-            run_nuclei_scan(target, target_ip, fp)
+            run_nuclei_scan(target, target_ip, fp, auto_mode=auto_mode)
 
         if skip_aggressive:
             print("[*] Skipping aggressive modules for this target.")
